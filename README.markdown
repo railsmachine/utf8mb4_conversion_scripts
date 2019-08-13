@@ -84,7 +84,7 @@ We have written two scripts to use PTOSC to handle the Barracuda conversion and 
 
 The first script changes the database's default character set to utf8mb4 and converts each table to Barracuda:
 
-```
+```shell
 #!/bin/bash
 
 # fill these out before running:
@@ -107,7 +107,7 @@ done
 
 The second script is a [Rails runner](http://guides.rubyonrails.org/command_line.html#rails-runner) script that will scan each column in each table and generate a bash script to convert the columns to utf8mb4:
 
-```
+```ruby
 db = ActiveRecord::Base.connection
 
 puts '#!/bin/bash'
@@ -153,7 +153,7 @@ Once the second script is finished the database will be fully converted to utf8m
 
 The scripts above are appropriate for converting your production database to utf8mb4, but what about your development database? If you have multiple developers it may be too much to ask each one to run these scripts against their development database. We've thought of that and created a normal Rails migration to handle converting the development and test databases to utf8mb4:
 
-```
+```ruby
 class ConvertDatabaseToUtf8mb4 < ActiveRecord::Migration[5.0]
   def db
     ActiveRecord::Base.connection
@@ -191,20 +191,22 @@ After following the steps above your database will be converted to utf8mb4, and 
 
 Create an initializer named `config/initializers/ar_innodb_row_format.rb` and paste the following code:
 
-    ActiveSupport.on_load :active_record do
-      module ActiveRecord::ConnectionAdapters
-        class AbstractMysqlAdapter
-          def create_table_with_innodb_row_format(table_name, options = {})
-            table_options = options.reverse_merge(:options => 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC')
-    
-            create_table_without_innodb_row_format(table_name, table_options) do |td|
-             yield td if block_given?
-            end
-          end
-          alias_method_chain :create_table, :innodb_row_format
+```ruby
+ActiveSupport.on_load :active_record do
+  module ActiveRecord::ConnectionAdapters
+    class AbstractMysqlAdapter
+      def create_table_with_innodb_row_format(table_name, options = {})
+        table_options = options.reverse_merge(:options => 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC')
+
+        create_table_without_innodb_row_format(table_name, table_options) do |td|
+         yield td if block_given?
         end
       end
+      alias_method_chain :create_table, :innodb_row_format
     end
+  end
+end
+```
 
 In newer versions of Rails or MySQL this monkey patch may not be necessary.
 
