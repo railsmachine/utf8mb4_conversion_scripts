@@ -2,8 +2,11 @@ db = ActiveRecord::Base.connection
 
 puts '#!/bin/bash'
 puts ""
+puts "# change dry-run to execute when you are confident the script is ready:"
 puts "COMMAND='dry-run'"
 puts ""
+puts "# put your db root password in here:"
+puts "DBPASS='fill me out'"
 puts ""
 
 db.tables.each do |table|
@@ -26,7 +29,7 @@ db.tables.each do |table|
   if column_conversions.empty?
     puts "# NO CONVERSIONS NECESSARY FOR #{table}"
   else
-    puts "pt-online-schema-change -uroot --alter '#{column_conversions.join(", ")}' D=#{db.current_database},t=#{table} --chunk-size=10k --critical-load Threads_running=200 --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --$COMMAND"
+    puts "pt-online-schema-change -uroot -p$DBPASS --alter '#{column_conversions.join(", ")}' D=#{db.current_database},t=#{table} --chunk-size=10k --critical-load Threads_running=200 --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --$COMMAND"
   end
   puts ""
 end

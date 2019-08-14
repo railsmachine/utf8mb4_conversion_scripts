@@ -31,7 +31,7 @@ To get around the 767 byte index key limit we must convert each of our tables to
 Before we can convert the tables to the Barracuda file format we must first set some configuration options. At a minimum you must set:
 
     innodb_file_format = Barracuda
-    innodb_large_prefix
+    innodb_large_prefix = ON
     innodb_file_per_table = 1
 
 I also recommend the following settings:
@@ -72,64 +72,80 @@ The full table copies required for the Barracuda conversion and changing the def
 
 This is where a tool called [pt-online-schema-change](https://www.percona.com/doc/percona-toolkit/3.0/pt-online-schema-change.html) comes in. At Rails Machine we have used pt-online-schema-change (PTOSC) for years for performing schema changes on large tables. It works by performing some clever tricks so that the amount of time that an exclusive lock must be acquired is very small. First it creates a new table with the same structure as the original table. It then runs the `ALTER TABLE` commands against this new table. These can complete very quickly since the table is empty. PTOSC then sets up triggers on the original table to replicate any `INSERT`, `UPDATE`, and `DELETE` queries in the new table. Next the rows from the original table are copied into the new table in batches. This can cause some increased load on the server so the size of the batches can be configured and PTOSC will throttle itself if CPU usage and concurrent query load gets too high in the database. Once PTOSC has finished copying the rows to the new table it briefly acquires an exclusive lock, deletes the triggers, drops the original table, and renames the new table to match the name of the original table. This typically only takes a few seconds at most.
 
+To install PTOSC (on Ubuntu):
+```
+wget https://repo.percona.com/apt/percona-release_0.1-6.$(lsb_release -sc)_all.deb
+sudo dpkg -i percona-release_0.1-6.$(lsb_release -sc)_all.deb
+sudo apt update
+sudo apt-get install percona-toolkit
+```
+
 We have written two scripts to use PTOSC to handle the Barracuda conversion and converting the existing columns to utf8mb4. These could be combined into a single script but I like to split it up for two reasons. First, I want to check the output of the Barracuda conversion to ensure there are no issues that need to be corrected before the columns are converted to utf8mb4. And second, the conversions can take a long time to run. So it's nice to have the option of running the first script overnight one day and then follow up with the utf8mb4 conversion script the next night.
 
 The first script changes the database's default character set to utf8mb4 and converts each table to Barracuda:
 
-    #!/bin/bash
-    
-    DATABASE=<database-name>
-    
-    COLLATE=utf8mb4_unicode_ci
-    ROW_FORMAT=DYNAMIC
-    THREADS_RUNNING=200
-    
-    TABLES=$(echo SHOW TABLES | mysql -uroot -s $DATABASE)
-    
-    echo "ALTER DATABASE $DATABASE CHARACTER SET utf8mb4 COLLATE $COLLATE" | mysql -uroot $DATABASE
-    
-    for TABLE in $TABLES ; do
-      echo "ALTER TABLE $TABLE ROW_FORMAT=$ROW_FORMAT CHARACTER SET utf8mb4 COLLATE $COLLATE;"
+```shell
+#!/bin/bash
 
-      pt-online-schema-change -uroot --alter "ROW_FORMAT=$ROW_FORMAT CHARACTER SET utf8mb4 COLLATE $COLLATE" D=$DATABASE,t=$TABLE --chunk-size=10k --critical-load Threads_running=$THREADS_RUNNING --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --execute
-    done
+# fill these out before running:
+DATABASE='your-database-name-here'
+DBPASS='your-password-here'
+
+COLLATE=utf8mb4_unicode_ci
+ROW_FORMAT=DYNAMIC
+THREADS_RUNNING=200
+
+TABLES=$(echo SHOW TABLES | mysql -uroot -p$DBPASS -s $DATABASE)
+
+echo "ALTER DATABASE $DATABASE CHARACTER SET utf8mb4 COLLATE $COLLATE" | mysql -uroot -p$DBPASS $DATABASE
+
+for TABLE in $TABLES ; do
+    echo "ALTER TABLE $TABLE ENGINE=InnoDB ROW_FORMAT=$ROW_FORMAT CHARACTER SET utf8mb4 COLLATE $COLLATE ROW_FORMAT=$ROW_FORMAT;"
+    pt-online-schema-change -uroot -p$DBPASS --alter "ENGINE=InnoDB ROW_FORMAT=$ROW_FORMAT CHARACTER SET utf8mb4 COLLATE $COLLATE" D=$DATABASE,t=$TABLE --chunk-size=10k --critical-load Threads_running=$THREADS_RUNNING --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --execute
+done
+```
 
 The second script is a [Rails runner](http://guides.rubyonrails.org/command_line.html#rails-runner) script that will scan each column in each table and generate a bash script to convert the columns to utf8mb4:
 
-    db = ActiveRecord::Base.connection
-    
-    puts '#!/bin/bash'
-    puts ""
-    puts "COMMAND='dry-run'"
-    puts ""
-    puts ""
-    
-    db.tables.each do |table|
-      column_conversions = []
-      db.columns(table).each do |column|
-        case column.sql_type
-          when /([a-z])*text/i
-            default = (column.default.blank?) ? '' : "DEFAULT \"#{column.default}\""
-            null = (column.null) ? '' : 'NOT NULL'
-            column_conversions << "MODIFY \`#{column.name}\` #{column.sql_type.upcase} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null}"
-          when /varchar\(([0-9]+)\)/i
-            sql_type = column.sql_type.upcase
-            default = (column.default.blank?) ? '' : "DEFAULT \"#{column.default}\""
-            null = (column.null) ? '' : 'NOT NULL'
-            column_conversions << "MODIFY \`#{column.name}\` #{sql_type} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null}".strip
-        end
-      end
-    
-      puts "# #{table}"
-      if column_conversions.empty?
-        puts "# NO CONVERSIONS NECESSARY FOR #{table}"
-      else
-        puts "pt-online-schema-change -uroot --alter '#{column_conversions.join(", ")}' D=#{db.current_database},t=#{table} --chunk-size=10k --critical-load Threads_running=200 --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --$COMMAND"
-      end
-      puts ""
-    end
+```ruby
+db = ActiveRecord::Base.connection
 
-Run this script with Rails runner and pipe the output to a file to: `RAILS_ENV=production bundle exec bin/rails runner create_column_conversions.rb >column_conversions.sh`. Then run the `column_conversions.sh` script to perform the conversions to utf8mb4.
+puts '#!/bin/bash'
+puts ""
+puts "# change dry-run to execute when you are confident the script is ready:"
+puts "COMMAND='dry-run'"
+puts ""
+puts "# put your db root password in here:"
+puts "DBPASS='fill me out'"
+puts ""
+
+db.tables.each do |table|
+  column_conversions = []
+  db.columns(table).each do |column|
+    case column.sql_type
+      when /([a-z])*text/i
+        default = (column.default.blank?) ? '' : "DEFAULT \"#{column.default}\""
+        null = (column.null) ? '' : 'NOT NULL'
+        column_conversions << "MODIFY \`#{column.name}\` #{column.sql_type.upcase} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null}"
+      when /varchar\(([0-9]+)\)/i
+        sql_type = column.sql_type.upcase
+        default = (column.default.blank?) ? '' : "DEFAULT \"#{column.default}\""
+        null = (column.null) ? '' : 'NOT NULL'
+        column_conversions << "MODIFY \`#{column.name}\` #{sql_type} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null}".strip
+    end
+  end
+
+  puts "# #{table}"
+  if column_conversions.empty?
+    puts "# NO CONVERSIONS NECESSARY FOR #{table}"
+  else
+    puts "pt-online-schema-change -uroot -p$DBPASS --alter '#{column_conversions.join(", ")}' D=#{db.current_database},t=#{table} --chunk-size=10k --critical-load Threads_running=200 --set-vars innodb_lock_wait_timeout=2 --alter-foreign-keys-method=auto --$COMMAND"
+  end
+  puts ""
+end
+```
+
+Run this script with Rails runner and pipe the output to a file to: `RAILS_ENV=production bundle exec bin/rails runner create_column_conversions.rb >column_conversions.sh`. Then edit `column_conversions.sh` to add your password and run the script to perform a dry-run of the conversions to utf8mb4. If it looks good, edit the script again and change the `COMMAND` to 'execute'. Then you can run it for real.
 
 Once the second script is finished the database will be fully converted to utf8mb4 and you can set `encoding: utf8mb4` in your `database.yml`.
 
@@ -137,34 +153,37 @@ Once the second script is finished the database will be fully converted to utf8m
 
 The scripts above are appropriate for converting your production database to utf8mb4, but what about your development database? If you have multiple developers it may be too much to ask each one to run these scripts against their development database. We've thought of that and created a normal Rails migration to handle converting the development and test databases to utf8mb4:
 
-    class ConvertDatabaseToUtf8mb4 < ActiveRecord::Migration[5.0]
-      def db
-        ActiveRecord::Base.connection
-      end
-    
-      def up
-        return if Rails.env.staging? or Rails.env.production?
-    
-        execute "ALTER DATABASE `#{db.current_database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-        db.tables.each do |table|
-          execute "ALTER TABLE `#{table}` ROW_FORMAT=DYNAMIC CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    
-          db.columns(table).each do |column|
-            case column.sql_type
-              when /([a-z]*)text/i
-                default = (column.default.blank?) ? '' : "DEFAULT '#{column.default}'"
-                null = (column.null) ? '' : 'NOT NULL'
-                execute "ALTER TABLE `#{table}` MODIFY `#{column.name}` #{column.sql_type.upcase} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null};"
-              when /varchar\(([0-9]+)\)/i
-                sql_type = column.sql_type.upcase
-                default = (column.default.blank?) ? '' : "DEFAULT '#{column.default}'"
-                null = (column.null) ? '' : 'NOT NULL'
-                execute "ALTER TABLE `#{table}` MODIFY `#{column.name}` #{sql_type} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null};"
-            end
-          end
+```ruby
+class ConvertDatabaseToUtf8mb4 < ActiveRecord::Migration[5.0]
+  def db
+    ActiveRecord::Base.connection
+  end
+
+  def up
+    return if Rails.env.staging? or Rails.env.production?
+
+    execute "ALTER DATABASE `#{db.current_database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    db.tables.each do |table|
+      execute "ALTER TABLE `#{table}` ENGINE=InnoDB ROW_FORMAT=DYNAMIC;"
+      execute "ALTER TABLE `#{table}` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+      db.columns(table).each do |column|
+        case column.sql_type
+          when /([a-z]*)text/i
+            default = (column.default.blank?) ? '' : "DEFAULT '#{column.default}'"
+            null = (column.null) ? '' : 'NOT NULL'
+            execute "ALTER TABLE `#{table}` MODIFY `#{column.name}` #{column.sql_type.upcase} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null};"
+          when /varchar\(([0-9]+)\)/i
+            sql_type = column.sql_type.upcase
+            default = (column.default.blank?) ? '' : "DEFAULT '#{column.default}'"
+            null = (column.null) ? '' : 'NOT NULL'
+            execute "ALTER TABLE `#{table}` MODIFY `#{column.name}` #{sql_type} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci #{default} #{null};"
         end
       end
     end
+  end
+end
+```
 
 ## Anything else?
 
@@ -172,20 +191,22 @@ After following the steps above your database will be converted to utf8mb4, and 
 
 Create an initializer named `config/initializers/ar_innodb_row_format.rb` and paste the following code:
 
-    ActiveSupport.on_load :active_record do
-      module ActiveRecord::ConnectionAdapters
-        class AbstractMysqlAdapter
-          def create_table_with_innodb_row_format(table_name, options = {})
-            table_options = options.reverse_merge(:options => 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC')
-    
-            create_table_without_innodb_row_format(table_name, table_options) do |td|
-             yield td if block_given?
-            end
-          end
-          alias_method_chain :create_table, :innodb_row_format
+```ruby
+ActiveSupport.on_load :active_record do
+  module ActiveRecord::ConnectionAdapters
+    class AbstractMysqlAdapter
+      def create_table_with_innodb_row_format(table_name, options = {})
+        table_options = options.reverse_merge(:options => 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC')
+
+        create_table_without_innodb_row_format(table_name, table_options) do |td|
+         yield td if block_given?
         end
       end
+      alias_method_chain :create_table, :innodb_row_format
     end
+  end
+end
+```
 
 In newer versions of Rails or MySQL this monkey patch may not be necessary.
 
